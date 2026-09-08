@@ -488,6 +488,22 @@ label{font-size:12.5px;color:var(--muted);display:block;margin-bottom:4px;}
 .pill-closed{background:#eef4ef;color:var(--accent-2);}
 .diff-cell{max-width:280px;}
 .top-actions{display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap;}
+
+/* 手機／窄螢幕 RWD：表格改成可以左右滑動，避免欄位被硬擠爆版；
+   按鈕、輸入框加大，方便手指點按；整體邊距縮小，多留一點內容空間。 */
+.table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:8px;}
+.table-scroll table{border-radius:0;}
+@media (max-width:700px){
+  main{padding:16px 14px 60px;}
+  header{padding:12px 16px;}
+  header h1{font-size:16px;}
+  .card{padding:16px;}
+  .table-scroll table{min-width:640px;}
+  .table-scroll table.table-wide{min-width:980px;}
+  .btn{padding:9px 14px;}
+  input[type=text],input[type=date],select{font-size:16px;padding:8px;}
+  .row{gap:10px;}
+}
 """
 
 LAYOUT = """
@@ -495,6 +511,7 @@ LAYOUT = """
 <html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ title or "法規鑑別追蹤工具" }}</title>
 <style>{{ css|safe }}</style>
 </head>
@@ -560,6 +577,7 @@ DASHBOARD_BODY = """
   </details>
 </div>
 
+<div class="table-scroll">
 <table>
   <thead><tr>
     <th>法規名稱</th><th>pcode</th><th>現行修正日期</th><th>已追蹤到</th>
@@ -597,6 +615,7 @@ DASHBOARD_BODY = """
     {% endfor %}
   </tbody>
 </table>
+</div>
 """
 
 
@@ -673,6 +692,7 @@ SEARCH_BODY = """
 <div class="flash">{{ error }}</div>
 {% elif keyword %}
   {% if results %}
+  <div class="table-scroll">
   <table>
     <thead><tr><th>法規名稱</th><th>pcode</th><th>現行修正日期</th><th style="width:220px;">操作</th></tr></thead>
     <tbody>
@@ -700,6 +720,7 @@ SEARCH_BODY = """
       {% endfor %}
     </tbody>
   </table>
+  </div>
   {% if truncated %}
   <p class="muted" style="margin-top:10px;">符合的結果較多，這裡只列出前面幾筆，如果沒看到你要的法規，
     請輸入更精確的關鍵字（例如加上「辦法」「規則」「標準」等法規名稱裡的字）。</p>
@@ -808,7 +829,8 @@ LAW_DETAIL_BODY = """
 </div>
 
 <form method="post" action="{{ url_for('save_findings', pcode=law.pcode) }}">
-<table>
+<div class="table-scroll">
+<table class="table-wide">
   <thead><tr>
     <th style="width:5%">條號</th>
     <th style="width:8%">異動</th>
@@ -848,6 +870,7 @@ LAW_DETAIL_BODY = """
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% if findings %}
 <p style="margin-top:14px;"><button class="btn btn-primary" type="submit">儲存這一頁的填寫內容</button></p>
 {% endif %}
