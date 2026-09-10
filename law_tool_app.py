@@ -61,6 +61,20 @@ BASE = "https://laws.mol.gov.tw"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; RegComplianceTool/0.2; internal use)"
 }
+
+# laws.mol.gov.tw 同時有 IPv4／IPv6 兩筆 DNS 紀錄。部署在 Railway 這類容器主機上時，
+# 主機本身常常沒有對外的 IPv6 路由，getaddrinfo() 卻可能把 IPv6 位址排在前面，
+# 導致 requests 連線時噴出「Network is unreachable」而完全連不上（IPv4 其實是通的，
+# 只是排序在後面沒機會被嘗試到）。這裡強制 urllib3 只查 IPv4 位址，避免這個問題；
+# 對本機執行、其他有正常 IPv6 對外連線的環境完全沒有副作用。
+try:
+    import urllib3.util.connection as _urllib3_cn
+    import socket as _socket
+
+    _urllib3_cn.allowed_gai_family = lambda: _socket.AF_INET
+except ImportError:
+    pass
+
 ARTICLE_NO_RE = re.compile(r"第\s*[\d\-]+\s*條")
 _WARNED_INSECURE = False
 
