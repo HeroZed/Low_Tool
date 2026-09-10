@@ -46,10 +46,18 @@ from flask import Flask, flash, redirect, render_template_string, request, send_
 from markupsafe import Markup, escape
 
 # ---------------------------------------------------------------------------
-# 全國法規資料庫 抓取／比對引擎（跟 moj_law_diff.py 同一套邏輯）
+# 勞動部勞動法令查詢系統 抓取／比對引擎（laws.mol.gov.tw）
+#
+# 原本這支工具是打「全國法規資料庫」（law.moj.gov.tw），改成打這個勞動部
+# 自己的系統，主要是因為對職業安全衛生法這種法規，勞動法令查詢系統的沿革
+# 頁面「每一次修正」都有留舊版全文可以直接抓（法規沿革頁面每一列都附
+# 「所有條文」連結），全國法規資料庫反而常常只留現在這一版，逼得工具要用
+# 公告文字反推異動條號、猜不到舊條文內容。這裡换成用舊版全文做逐字比對，
+# 準確度好很多，公告文字解析（parse_history_entries）留著當「萬一某部法規
+# 也一樣沒留舊版全文」時的備援，邏輯完全比照原本那一版。
 # ---------------------------------------------------------------------------
 
-BASE = "https://law.moj.gov.tw/LawClass"
+BASE = "https://laws.mol.gov.tw"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; RegComplianceTool/0.2; internal use)"
 }
@@ -58,15 +66,15 @@ _WARNED_INSECURE = False
 
 
 def http_get(url: str):
-    """對全國法規資料庫發出 GET 請求；遇到某些 Windows 環境常見的憑證驗證
-    相容性錯誤時，自動退回不驗證憑證的方式重試一次。"""
+    """對勞動部勞動法令查詢系統發出 GET 請求；遇到某些 Windows 環境常見的
+    憑證驗證相容性錯誤時，自動退回不驗證憑證的方式重試一次。"""
     global _WARNED_INSECURE
     try:
         resp = requests.get(url, headers=HEADERS, timeout=20)
     except requests.exceptions.SSLError:
         if not _WARNED_INSECURE:
             print(
-                "提醒：本機的憑證驗證對 law.moj.gov.tw 回報相容性錯誤，"
+                "提醒：本機的憑證驗證對 laws.mol.gov.tw 回報相容性錯誤，"
                 "已自動改用不驗證憑證的方式重新連線（僅讀取公開政府法規網站，風險低）。",
                 file=sys.stderr,
             )
@@ -85,11 +93,13 @@ def normalize_article_no(raw: str) -> str:
 
 
 def fetch_articles(url: str) -> dict:
+    """抓某一頁『所有條文』（現行版 FLAWDAT0201 或指定日期的舊版 FLAWDAT08）
+    的內容，回傳 {正規化條號: 條文內容}。"""
     resp = http_get(url)
     resp.encoding = resp.apparent_encoding or "utf-8"
     soup = BeautifulSoup(resp.text, "html.parser")
     articles = {}
-    for row in soup.select(".law-reg .row"):
+    for row in soup.select(".row"):
         no_el = row.select_one(".col-no")
         data_el = row.select_one(".col-data")
         if not no_el or not data_el:
@@ -105,6 +115,9 @@ def fetch_articles(url: str) -> dict:
 
 
 def roc_to_yyyymmdd(s: str):
+    """把「民國114年12月19日」這種阿拉伯數字寫法的日期轉成 yyyymmdd。法規
+    摘要欄位（公(發)布日期／修正日期）用的是這種格式；沿革逐條公告文字用的
+    是純國字數字，要用 roc_cn_to_yyyymmdd()。"""
     if not s:
         return None
     m = re.search(r"(\d+)\s*年\s*(\d+)\s*月\s*(\d+)\s*日", s)
@@ -114,10 +127,167 @@ def roc_to_yyyymmdd(s: str):
     return f"{roc_year + 1911:04d}{month:02d}{day:02d}"
 
 
+def yyyymmdd_to_roc_display(d: str) -> str:
+    y, mo, da = int(d[0:4]), int(d[4:6]), int(d[6:8])
+    return f"民國 {y - 1911} 年 {mo:02d} 月 {da:02d} 日"
+
+
 def fmt_date(d: str) -> str:
     if not d or len(d) != 8:
         return d or ""
     return f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
+
+
+# ---------------------------------------------------------------------------
+# 沿革公告文字解析：勞動法令查詢系統對每一次修正都會留一段公告原文（例如
+# 「修正公布第2、6條條文；增訂第15-1條條文」），這裡解析成結構化的「這次
+# 修正/增訂/刪除了哪些條號」，並且額外算出「這次修正實際生效的日期」——
+# 很多修正是「公告日」跟「施行日」不同天（甚至公告時寫「施行日期，由行政院
+# 定之」，實際日期要等後續另一則公告才知道），你特別交代過要排除「已公告
+# 但還沒生效」的修正，所以這裡不能只看公告日期，要盡量抓出真正生效的那天，
+# 抓不到明確生效日時保守當作跟公告日同一天生效。
+#
+# 這段解析的對象是政府公告的自然語言文字，用詞、標點不完全一致（有的用
+# 「修正公布」有的用「修正發布」，「－」跟「～」意義也不同：「～」是「從～到～」
+# 的條號範圍，「－」是「之幾」的子條號如「第15-1條」），已經涵蓋常見的幾種
+# 寫法，但無法保證每一種罕見寫法都解析得出來；解析不出具體條號時，呼叫端
+# 一律會退回「請自行到沿革頁面確認」的警示，不會因為解析失敗就誤報成
+# 「沒有異動」。
+# ---------------------------------------------------------------------------
+
+_CN_NUM_MAP = {"零": 0, "〇": 0, "一": 1, "二": 2, "兩": 2, "三": 3, "四": 4,
+               "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_CN_UNIT_MAP = {"十": 10, "百": 100, "千": 1000}
+_CN_NUM_CLASS = "[一二三四五六七八九十百千零〇兩]"
+
+
+def cn_num_to_int(s: str):
+    """把中文數字（如「一百十四」「九十一」「十九」）轉成阿拉伯數字，用來讀
+    沿革公告裡「中華民國一百十四年十二月十九日」這種完全用國字寫的日期
+    （法規本身摘要欄位的日期是阿拉伯數字，但沿革逐條公告文字習慣用國字，
+    兩邊要分開處理）。只處理到千位，日期用途绰绰有餘。"""
+    if not s:
+        return None
+    result, pending = 0, 0
+    if s[0] == "十":
+        result = 10
+        s = s[1:]
+    for ch in s:
+        if ch in _CN_NUM_MAP:
+            pending = _CN_NUM_MAP[ch]
+        elif ch in _CN_UNIT_MAP:
+            result += (pending if pending else 1) * _CN_UNIT_MAP[ch]
+            pending = 0
+    return result + pending
+
+
+def roc_cn_to_yyyymmdd(text: str):
+    m = re.search(rf"中華民國({_CN_NUM_CLASS}+)年({_CN_NUM_CLASS}+)月({_CN_NUM_CLASS}+)日", text)
+    if not m:
+        return None
+    y, mo, d = (cn_num_to_int(g) for g in m.groups())
+    if y is None or mo is None or d is None:
+        return None
+    return f"{y + 1911:04d}{mo:02d}{d:02d}"
+
+
+def _entry_effective_date(compact_text: str, promulgation_date: str) -> str:
+    """從沿革單筆公告文字判斷『這次修正真正生效』的日期。公告文字常見寫法：
+    「自即日施行」「自發布日施行」＝跟公告日同一天；「自OO年OO月OO日施行」＝
+    明確指定一天；有時同一則公告會分好幾批生效（不同條文分批），這裡採保守
+    做法——抓到的候選生效日一律取『最晚』的一個，寧可晚一點才把這次修正當
+    作已生效，也不要把還沒全部生效的修正提早當成現行條文（這是你特別要求
+    的：預告中、還沒生效的一律不算）。完全找不到生效日說明的罕見情況，保守
+    當作跟公告日同一天生效。"""
+    dates_found = []
+    if re.search(r"自(即日|發布日|公布日)施行", compact_text):
+        dates_found.append(promulgation_date)
+    for m in re.finditer(rf"自({_CN_NUM_CLASS}+)年({_CN_NUM_CLASS}+)月({_CN_NUM_CLASS}+)日施行", compact_text):
+        y, mo, d = (cn_num_to_int(g) for g in m.groups())
+        if y is not None and mo is not None and d is not None:
+            dates_found.append(f"{y + 1911:04d}{mo:02d}{d:02d}")
+    if not dates_found:
+        return promulgation_date
+    return max(dates_found)
+
+
+def _expand_article_tokens(numlist: str) -> list:
+    """把「2、6、9、43～46」這種用頓號分隔、可能帶「～」範圍或「－」子條號的
+    條號清單，展開成正規化的條號字串列表（跟 normalize_article_no() 產生的
+    格式一致，例如「第43條」「第15-1條」），才能跟抓下來的條文內容對上。"""
+    tokens = [t for t in re.split(r"[、，]", numlist) if t]
+    out = []
+    for tok in tokens:
+        m = re.match(r"^(\d+)-(\d+)～(\d+)-(\d+)$", tok)
+        if m:
+            base1, a, base2, c = m.groups()
+            if base1 == base2 and int(a) <= int(c):
+                out.extend(f"第{base1}-{i}條" for i in range(int(a), int(c) + 1))
+            else:
+                out.extend([f"第{base1}-{a}條", f"第{base2}-{c}條"])
+            continue
+        m = re.match(r"^(\d+)～(\d+)$", tok)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a <= b:
+                out.extend(f"第{i}條" for i in range(a, b + 1))
+            else:
+                out.append(f"第{tok}條")
+            continue
+        out.append(f"第{tok}條")
+    return out
+
+
+def parse_history_entries(soup) -> list:
+    """解析法規沿革頁面（.law-history）裡每一次公告的說明文字，回傳每次公告
+    的公告日期（date）、實際生效日期（effective_date），以及這次「修正」
+    「增訂」「刪除」了哪些條號（找不到具體條號、或這次是修正/制定「全文」
+    沒有逐條列出的，對應欄位就是空 list／full_revision=True）。is_latest 標記
+    是不是沿革清單裡最新的那一筆——勞動法令查詢系統對「目前最新、還沒被
+    取代」的版本，全文要去現行條文頁（FLAWDAT0201）抓，其餘已被取代的舊
+    版本才能用歷史條文頁（FLAWDAT08+ldate）抓，這個判斷只看『是不是清單
+    裡最新一筆』，跟它是否已經生效無關（即使最新這筆還沒生效，網站上它也
+    還不是「歷史版本」）。
+    依公告日期新到舊排序，跟 list_versions() 的 versions 排序方式一致。"""
+    entries = []
+    rows = soup.select(".law-history .row")
+    for i, row in enumerate(rows):
+        data_el = row.select_one(".col-data")
+        if not data_el:
+            continue
+        raw = data_el.get_text("", strip=True)
+        compact = re.sub(r"\s+", "", raw)
+        if not re.match(r"^\d+\.", compact):
+            continue
+        entry_date = roc_cn_to_yyyymmdd(compact)
+        if not entry_date:
+            continue
+
+        full_revision = bool(re.search(r"(修正|制定|訂定)(公布|發布)(名稱及)?全文\d+條", compact))
+
+        amended, added, deleted = [], [], []
+        for verb, nums in re.findall(r"(修正公布|修正發布|增訂|刪除)第([\d、，\-～]+)條", compact):
+            arts = _expand_article_tokens(nums)
+            if verb in ("修正公布", "修正發布"):
+                amended.extend(arts)
+            elif verb == "增訂":
+                added.extend(arts)
+            elif verb == "刪除":
+                deleted.extend(arts)
+
+        entries.append({
+            "date": entry_date,
+            "effective_date": _entry_effective_date(compact, entry_date),
+            "raw_text": raw, "full_revision": full_revision,
+            "amended": amended, "added": added, "deleted": deleted,
+        })
+    # 頁面上的沿革列表是按公告時間「舊到新」排列（第一列是最早的制定公布），
+    # 不是新到舊，所以「是不是最新一筆」不能看 DOM 原始 index，要照公告日期
+    # 排序後才知道；排序完 entries[0] 才是真正最新的那一筆。
+    entries.sort(key=lambda e: e["date"], reverse=True)
+    for i, e in enumerate(entries):
+        e["is_latest"] = i == 0
+    return entries
 
 
 def _shift_day(d: str, delta: int) -> str:
@@ -134,7 +304,10 @@ def next_day(d: str) -> str:
 
 
 def list_versions(pcode: str) -> dict:
-    url = f"{BASE}/LawHistory.aspx?pcode={pcode}"
+    """pcode 在這個資料來源其實是勞動法令查詢系統的法規代碼 id（例如
+    「FL015013」，格式跟舊的全國法規資料庫 pcode 不一樣，但沿用同一個欄位
+    名稱、同一套資料庫結構，改動範圍降到最小）。"""
+    url = f"{BASE}/FLAW/FLAWDAT07.aspx?id={pcode}"
     resp = http_get(url)
     resp.encoding = resp.apparent_encoding or "utf-8"
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -145,84 +318,95 @@ def list_versions(pcode: str) -> dict:
         row = name_el.find_parent("tr") or name_el.find_parent()
         if row:
             law_name = row.get_text(" ", strip=True).replace("法規名稱：", "").strip()
-            law_name = re.sub(r"\s*EN\s*$", "", law_name).strip()
+            law_name = re.sub(r"\s*英\s*$", "", law_name).strip()
 
     amend_date_display = None
-    for label in ("修正日期", "發布日期"):
-        el = soup.find(string=re.compile(label))
+    for label in ("修正日期", "公(發)布日期", "發布日期"):
+        el = soup.find(string=re.compile(re.escape(label)))
         if not el:
             continue
         row = el.find_parent("tr") or el.find_parent()
         if row:
             amend_date_display = row.get_text(" ", strip=True).replace(f"{label}：", "").strip()
             break
-    current_date = roc_to_yyyymmdd(amend_date_display)
 
-    versions = []
-    if current_date:
-        versions.append({"date": current_date, "source": "current", "lnndate": None, "lser": None})
+    history_entries = parse_history_entries(soup)
 
-    seen_dates = {current_date} if current_date else set()
-    for a in soup.find_all("a", href=re.compile(r"LawOldVer\.aspx\?pcode=")):
-        href = a.get("href", "")
-        m_date = re.search(r"lnndate=(\d{8})", href)
-        if not m_date:
-            continue
-        d = m_date.group(1)
-        if d in seen_dates:
-            continue
-        seen_dates.add(d)
-        m_lser = re.search(r"lser=(\d+)", href)
-        versions.append(
-            {"date": d, "source": "old", "lnndate": d, "lser": m_lser.group(1) if m_lser else "001"}
-        )
-
+    versions = [
+        {"date": e["effective_date"], "ldate": e["date"], "source": "current" if e["is_latest"] else "old"}
+        for e in history_entries
+    ]
     versions.sort(key=lambda v: v["date"], reverse=True)
-    return {"law_name": law_name, "amend_date_display": amend_date_display, "versions": versions}
+
+    # 如果沿革清單裡最新一筆的生效日還沒到（今天還沒到那一天），首頁摘要的
+    # 「現行修正日期」不能直接顯示網站原本標的那個修正日期，不然會讓人誤以
+    # 為那次修正已經生效——改成顯示『目前真正有效』那個版本（也就是這次還
+    # 沒生效之前，實際還在適用的上一版）的公告日期。
+    today_str = date.today().strftime("%Y%m%d")
+    still_effective = [v for v in versions if v["date"] <= today_str]
+    if still_effective and history_entries and still_effective[0]["ldate"] != history_entries[0]["date"]:
+        eff_entry = next((e for e in history_entries if e["date"] == still_effective[0]["ldate"]), None)
+        if eff_entry:
+            amend_date_display = yyyymmdd_to_roc_display(eff_entry["date"])
+
+    return {
+        "law_name": law_name, "amend_date_display": amend_date_display,
+        "versions": versions, "history_entries": history_entries,
+    }
 
 
 def search_laws_by_keyword(keyword: str, max_pages: int = 2) -> tuple:
-    """用法規名稱關鍵字查詢全國法規資料庫（中央法規查詢的「法規名稱」比對，
-    不是條文內容比對），回傳可能對應的法規清單。每筆包含 pcode、法規名稱、
-    現行修正日期、是否已廢止。第二個回傳值代表結果是否被截斷（代表還有更多筆，
-    建議使用者輸入更精確的關鍵字）。"""
+    """用法規名稱關鍵字查詢勞動部勞動法令查詢系統，回傳可能對應的法規清單。
+
+    一開始是直接打整合查詢（不帶 type 參數），結果會把關鍵字出現在『條文
+    內容』裡、甚至其他分類（行政規則、解釋令函）的東西全部混在一起、依
+    相關度排序，導致「職業安全衛生法」這種關鍵字搜尋出一堆名稱完全不相關
+    的法規（因為條文裡剛好提到這幾個字）——這裡改成帶 type=name,01,02,03
+    這個查詢參數，只比對『法規名稱』本身有沒有出現關鍵字（網站上「法規
+    查詢／法規名稱」那個篩選分頁用的就是這個參數），結果精確很多，也已經
+    是部分比對（不用打完整全名一樣找得到）。這個篩選本身就不包含「法規
+    草案」（草案是另一個獨立的 type=drafts 分類），天然符合『只採用已經
+    生效的法規，草案不算』的要求，不用再另外判斷類別或生效狀態。
+    這個篩選底下的結果如果是已廢止的法規，名稱前面會帶一個 class="fei"
+    的「廢」字樣提示，這裡順便解析出來存進 repealed 欄位，畫面上會顯示
+    「已廢止」提示，由使用者自己決定要不要繼續追蹤。
+    第二個回傳值代表結果是否被截斷（代表還有更多筆，建議使用者輸入更精確
+    的關鍵字）。"""
     from urllib.parse import quote
 
     results = []
     truncated = False
     for page in range(1, max_pages + 1):
-        url = (
-            "https://law.moj.gov.tw/Law/LawSearchResult.aspx"
-            f"?cur=Ln&ty=LAW&kw={quote(keyword)}&mo=1&page={page}"
-        )
+        url = f"{BASE}/results.aspx?searchmode=global&keyword={quote(keyword)}&type=name,01,02,03&page={page}"
         resp = http_get(url)
         resp.encoding = resp.apparent_encoding or "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
-        panel = soup.select_one("#pnLaw")
-        if not panel:
+        table = soup.select_one("table.laws-table") or soup.select_one("table")
+        if not table:
             break
-        rows = panel.select("tbody tr")
+        rows = table.select("tr")[1:]  # 跳過表頭那一列（序／附件或筆數／法規名稱／異動日期）
         if not rows:
             break
         for tr in rows:
-            a, pcode = None, None
-            for cand in tr.find_all("a"):
-                m = re.search(r"pcode=([^&]+)", cand.get("href", ""), re.IGNORECASE)
-                if m:
-                    a, pcode = cand, m.group(1)
-                    break
-            if not pcode:
+            tds = tr.find_all("td")
+            if len(tds) < 4:
                 continue
-            row_text = tr.get_text(" ", strip=True)
-            date_m = re.search(r"民國\s*\d+\s*年\s*\d+\s*月\s*\d+\s*日", row_text)
-            results.append(
-                {
-                    "pcode": pcode,
-                    "law_name": a.get("title") or a.get_text(strip=True),
-                    "amend_date_display": date_m.group(0) if date_m else "",
-                    "repealed": tr.select_one(".label-fei") is not None,
-                }
-            )
+            a = tds[2].find("a")
+            if not a:
+                continue
+            m = re.search(r"[?&]id=([A-Za-z0-9]+)", a.get("href", ""))
+            if not m:
+                continue
+            fei_span = a.find("span", class_="fei")
+            repealed = fei_span is not None
+            if fei_span:
+                fei_span.extract()  # 拿掉「廢」字樣，才不會混進法規名稱裡
+            results.append({
+                "pcode": m.group(1),
+                "law_name": a.get_text(strip=True),
+                "amend_date_display": tds[3].get_text(strip=True),
+                "repealed": repealed,
+            })
         if len(rows) < 20:
             break
         if page == max_pages:
@@ -238,11 +422,15 @@ def version_asof(versions_desc: list, target_date: str, strict_before: bool = Fa
 
 
 def fetch_version_articles(pcode: str, version: dict) -> dict:
+    """version["date"] 存的是『生效日』（比對邏輯用這個），但抓舊版全文網址
+    要用『公告日』（version["ldate"]）——勞動法令查詢系統的歷史條文頁是用
+    公告日當查詢參數，這兩個日期在「公告後延後施行」的修正裡並不是同一天。
+    is_latest（也就是 source=="current"）的版本要用現行條文頁抓，不能用
+    歷史條文頁：這個網站對「還沒被取代的最新版本」帶公告日查歷史條文頁會
+    直接回錯誤頁。"""
     if version["source"] == "current":
-        return fetch_articles(f"{BASE}/LawAll.aspx?pcode={pcode}")
-    return fetch_articles(
-        f"{BASE}/LawOldVer.aspx?pcode={pcode}&lnndate={version['lnndate']}&lser={version['lser']}"
-    )
+        return fetch_articles(f"{BASE}/FLAW/FLAWDAT0201.aspx?id={pcode}")
+    return fetch_articles(f"{BASE}/FLAW/FLAWDAT08.aspx?id={pcode}&ldate={version['ldate']}")
 
 
 def inline_diff(old_text: str, new_text: str):
@@ -262,6 +450,89 @@ def inline_diff(old_text: str, new_text: str):
     return old_runs, new_runs
 
 
+def _history_based_rows(pcode: str, history_entries: list, since: str, until: str, new_v: dict) -> tuple:
+    """在完全抓不到舊版全文可以自動比對時（baseline_missing）的備援方案：改
+    用沿革頁面的公告文字，找出「追蹤起始日之後」公告過的那幾次修正，從公告
+    原文解析出實際異動了哪些條號，逐條列進待鑑別清單——新增的條文可以直接
+    抓現行條文全文當作『新增後的內容』（新增條文本來就沒有舊條文可比，這點
+    跟平常真的能比對到舊版本時的處理方式一致）；修正/刪除的條文因為真的沒有
+    舊條文可比，只能標注清楚、附上沿革頁面連結，請使用者自行核對。
+    回傳 (changed_rows, extra_note)：extra_note 是要額外附加在 note 欄位、
+    講清楚這份清單是怎麼來的一句話；解析不到任何具體條號時 changed_rows 只有
+    一筆通用警示（跟完全沒有沿革資料可解析時的後備行為一樣），確保不會因為
+    公告文字解析失敗就悄悄漏掉這次修正。"""
+    qualifying = [e for e in history_entries if since and since < e["date"] <= until]
+    hist_url = f"{BASE}/FLAW/FLAWDAT07.aspx?id={pcode}"
+
+    def generic_warning():
+        warn_text = (
+            f"勞動法令查詢系統沒有保留 {fmt_date(new_v['date'])} 這次修正之前的完整條文"
+            f"（該法規沿革頁面沒有提供舊版全文連結），系統無法自動抓出實際異動了哪些條文。"
+            f"這次修正的日期在追蹤起始日之後，請務必到勞動法令查詢系統的「法規沿革」頁面"
+            f"（{hist_url}）查看公告內容，自行確認異動條文並完成鑑別，鑑別完再把這一筆勾選結案。"
+        )
+        return [{
+            "article_no": "（系統無法自動比對）", "status": "警示",
+            "old_runs": [(warn_text, True)],
+            "new_runs": [(f"（請自行查閱 {fmt_date(new_v['date'])} 生效的現行條文全文）", False)],
+        }]
+
+    if not qualifying:
+        return generic_warning(), None
+
+    if any(e["full_revision"] for e in qualifying):
+        dates = "、".join(fmt_date(e["date"]) for e in qualifying if e["full_revision"])
+        warn_text = (
+            f"{dates} 的公告是修正／制定「全文」，公告原文沒有逐條列出異動條號，"
+            f"勞動法令查詢系統也沒有保留修正前的舊條文，系統無法自動比對出差異，"
+            f"請至沿革頁面（{hist_url}）查看公告內容，並將全部條文都列入這次鑑別範圍。"
+        )
+        rows = [{
+            "article_no": "（全文修正，需整部重新鑑別）", "status": "警示",
+            "old_runs": [(warn_text, True)],
+            "new_runs": [(f"（請自行查閱 {fmt_date(new_v['date'])} 生效的現行條文全文）", False)],
+        }]
+        return rows, "偵測到全文修正／制定公告，公告文字沒有逐條列出條號，已提醒需整部重新鑑別。"
+
+    current = fetch_version_articles(pcode, new_v)
+    rows, seen = [], set()
+    for e in qualifying:
+        for no in e["added"]:
+            if no in seen:
+                continue
+            seen.add(no)
+            text = current.get(no) or "（找不到現行條文內容，請自行至法規內容頁查閱）"
+            rows.append({"article_no": no, "status": "新增", "old_runs": [], "new_runs": [(text, True)]})
+        for no in e["amended"]:
+            if no in seen:
+                continue
+            seen.add(no)
+            text = current.get(no) or "（找不到現行條文內容，請自行至法規內容頁查閱）"
+            old_text = (
+                f"勞動法令查詢系統未保留 {fmt_date(e['date'])} 這次修正前的舊條文，"
+                f"請至沿革頁面（{hist_url}）查看公告內容自行比對修正前後差異。"
+            )
+            rows.append({"article_no": no, "status": "修正", "old_runs": [(old_text, True)], "new_runs": [(text, True)]})
+        for no in e["deleted"]:
+            if no in seen:
+                continue
+            seen.add(no)
+            old_text = (
+                f"此條文已於 {fmt_date(e['date'])} 被刪除，勞動法令查詢系統未保留刪除前的條文全文，"
+                f"請至沿革頁面（{hist_url}）查看公告內容。"
+            )
+            rows.append({"article_no": no, "status": "刪除", "old_runs": [(old_text, True)], "new_runs": []})
+
+    if not rows:
+        return generic_warning(), None
+
+    entry_dates = "、".join(fmt_date(e["date"]) for e in qualifying)
+    return rows, (
+        f"以上是根據沿革頁面 {entry_dates} 公告文字解析出來的異動條號（不是逐字比對舊條文），"
+        f"「修正」「刪除」的條文因為資料庫沒有保留舊條文，請自行到沿革頁面核對修正前的內容。"
+    )
+
+
 def build_report(pcode: str, since: str = None, until: str = None):
     """比對某一部法規的新舊條文；given since，抓『since 之前最後生效的版本』
     對『until（預設今天）當時生效的版本』；沒給 since 就跟現行版本對上一版比。"""
@@ -272,6 +543,7 @@ def build_report(pcode: str, since: str = None, until: str = None):
 
     versions = info["versions"]
     amend_date = info["amend_date_display"]
+    baseline_missing = False
 
     if since is None:
         if len(versions) < 2:
@@ -279,6 +551,7 @@ def build_report(pcode: str, since: str = None, until: str = None):
                 "pcode": pcode, "law_name": law_name, "amend_date": amend_date,
                 "old_version_date": None, "new_version_date": None,
                 "amendment_dates_in_range": None, "note": None, "changed_rows": [],
+                "baseline_missing": False,
             }
         new_v, old_v, note = versions[0], versions[1], None
         until = until or versions[0]["date"]
@@ -291,16 +564,37 @@ def build_report(pcode: str, since: str = None, until: str = None):
             raise RuntimeError(f"{fmt_date(until)} 這個日期比這部法規最早的資料還早，查不到任何版本。")
         if old_v is None:
             old_v = versions[-1]
+            baseline_missing = True
             note = (
                 f"這個資料庫對此法規最早只能追溯到 {fmt_date(old_v['date'])}，"
                 f"更早之前的版本無法比對，已改用這個最早版本當基準。"
             )
 
     if old_v["date"] == new_v["date"]:
+        changed_rows = []
+        # baseline_missing 代表：往前找不到「追蹤起始日之前」有效的版本，只好
+        # 拿資料庫裡找得到的最早版本（old_v）當基準——但這裡它又剛好跟現在
+        # 生效的版本（new_v）是同一份，等於完全沒有更早的舊條文可以比對。
+        # 這時候絕對不能直接回報「沒有新的修正」：現行版本的修正日期
+        # （new_v）如果就落在追蹤起始日之後，代表追蹤期間內其實真的發生過
+        # 修正，只是勞動法令查詢系統沒有保留修正前的舊條文、系統沒辦法自動逐字
+        # 比對出異動了哪些條文而已。這時候改用沿革頁面的公告文字當備援資料
+        # 來源：從公告原文解析出這次實際修正/增訂/刪除了哪些條號，把每一條
+        # 分開列進待鑑別清單（新增的條文可以直接附上現行條文全文），逼使用者
+        # 針對「修正」「刪除」的條文自己到沿革頁面核對前後差異，鑑別完再手動
+        # 勾選結案——不管解析成不成功，都不會像以前一樣悄悄回報「沒有異動」
+        # 而漏掉這次修正。
+        if baseline_missing:
+            changed_rows, extra_note = _history_based_rows(
+                pcode, info.get("history_entries") or [], since, until, new_v
+            )
+            if extra_note:
+                note = f"{note}{extra_note}"
         return {
             "pcode": pcode, "law_name": law_name, "amend_date": amend_date,
             "old_version_date": old_v["date"], "new_version_date": new_v["date"],
-            "amendment_dates_in_range": [], "note": note, "changed_rows": [],
+            "amendment_dates_in_range": [], "note": note, "changed_rows": changed_rows,
+            "baseline_missing": baseline_missing,
         }
 
     old = fetch_version_articles(pcode, old_v)
@@ -327,6 +621,7 @@ def build_report(pcode: str, since: str = None, until: str = None):
         "pcode": pcode, "law_name": law_name, "amend_date": amend_date,
         "old_version_date": old_v["date"], "new_version_date": new_v["date"],
         "amendment_dates_in_range": amendment_dates_in_range, "note": note, "changed_rows": rows,
+        "baseline_missing": baseline_missing,
     }
 
 
@@ -518,7 +813,7 @@ LAYOUT = """
 <body>
 <header>
   <h1><a href="{{ url_for('dashboard') }}">法規鑑別追蹤工具</a></h1>
-  <div class="muted" style="font-size:12.5px;">資料來源：全國法規資料庫（law.moj.gov.tw）</div>
+  <div class="muted" style="font-size:12.5px;">資料來源：勞動部勞動法令查詢系統（laws.mol.gov.tw）</div>
 </header>
 <main>
   {% with messages = get_flashed_messages() %}
@@ -542,6 +837,10 @@ DASHBOARD_BODY = """
     <button class="btn btn-primary" type="submit">全部立即比對</button>
   </form>
   <a class="btn" href="{{ url_for('export_all') }}">匯出全部法規 Excel</a>
+  <form method="post" action="{{ url_for('migrate_pcode') }}"
+        onsubmit="return confirm('這是資料來源改成勞動法令查詢系統後的一次性修復：會嘗試把清單裡還在用舊代碼的法規自動換成新代碼，既有的鑑別紀錄不會不見。確定要執行嗎？');">
+    <button class="btn" type="submit">修復舊資料來源代碼</button>
+  </form>
 </div>
 
 <div class="card">
@@ -551,6 +850,14 @@ DASHBOARD_BODY = """
       <div>
         <label>用法規名稱關鍵字搜尋（推薦，不用打完整全名，例如「教育訓練規則」）</label>
         <input type="text" name="kw" placeholder="輸入法規名稱關鍵字">
+      </div>
+      <div style="flex:0;min-width:150px;">
+        <label>追蹤起始日（套用到搜尋結果裡勾選的法規）</label>
+        <input type="date" name="start_date" value="{{ year_start }}">
+      </div>
+      <div style="flex:0;min-width:150px;">
+        <label>追蹤結束日（選填）</label>
+        <input type="date" name="end_date" value="{{ today }}">
       </div>
       <div style="flex:0;">
         <button class="btn btn-primary" type="submit">搜尋法規</button>
@@ -562,12 +869,12 @@ DASHBOARD_BODY = """
     <form method="post" action="{{ url_for('add_law') }}" style="margin-top:12px;">
       <div class="row">
         <div>
-          <label>法規代碼（pcode，可從 law.moj.gov.tw 該法規網址的 pcode= 後面找到）</label>
-          <input type="text" name="pcode" placeholder="例如 N0060010" required>
+          <label>法規代碼（可從 laws.mol.gov.tw 該法規網址的 id= 後面找到）</label>
+          <input type="text" name="pcode" placeholder="例如 FL015013" required>
         </div>
         <div>
           <label>追蹤起始日（只比對這天之後發生的修正）</label>
-          <input type="date" name="start_date" value="{{ today }}" required>
+          <input type="date" name="start_date" value="{{ year_start }}" required>
         </div>
         <div style="flex:0;">
           <button class="btn btn-primary" type="submit">新增</button>
@@ -575,6 +882,21 @@ DASHBOARD_BODY = """
       </div>
     </form>
   </details>
+</div>
+
+<div class="row" style="align-items:end;margin-bottom:10px;">
+  <div style="flex:0;min-width:230px;">
+    <label>排序方式</label>
+    <select onchange="location.href='{{ url_for('dashboard') }}?sort='+this.value">
+      <option value="" {{ "selected" if not sort else "" }}>預設（新增順序）</option>
+      <option value="amend_desc" {{ "selected" if sort=="amend_desc" else "" }}>現行修正日期：新→舊</option>
+      <option value="amend_asc" {{ "selected" if sort=="amend_asc" else "" }}>現行修正日期：舊→新</option>
+      <option value="checked_desc" {{ "selected" if sort=="checked_desc" else "" }}>已追蹤到：新→舊</option>
+      <option value="checked_asc" {{ "selected" if sort=="checked_asc" else "" }}>已追蹤到：舊→新</option>
+      <option value="open_first" {{ "selected" if sort=="open_first" else "" }}>待鑑別：未結案優先</option>
+      <option value="open_last" {{ "selected" if sort=="open_last" else "" }}>待鑑別：已結案優先</option>
+    </select>
+  </div>
 </div>
 
 <div class="table-scroll">
@@ -587,7 +909,7 @@ DASHBOARD_BODY = """
     {% for law in laws %}
     <tr>
       <td><a href="{{ url_for('law_detail', pcode=law.pcode) }}">{{ law.law_name or law.pcode }}</a>
-        {% if law.note %}<div class="muted" style="font-size:12px;">{{ law.note }}</div>{% endif %}
+        {% if law.note %}<div style="font-size:12px;color:var(--accent);">⚠ {{ law.note }}</div>{% endif %}
       </td>
       <td class="muted">{{ law.pcode }}</td>
       <td>{{ law.amend_date_display or "-" }}</td>
@@ -619,8 +941,88 @@ DASHBOARD_BODY = """
 """
 
 
+def _sort_dashboard_rows(rows: list, sort: str) -> list:
+    """依照下拉選單選的排序方式排序法規清單；沒給或給不認得的值就維持原本
+    （新增順序）不動。日期缺值一律排到最後，不管是新→舊還是舊→新。"""
+    if sort == "amend_desc":
+        rows.sort(key=lambda d: roc_to_yyyymmdd(d["amend_date_display"]) or "", reverse=True)
+    elif sort == "amend_asc":
+        rows.sort(key=lambda d: roc_to_yyyymmdd(d["amend_date_display"]) or "99999999")
+    elif sort == "checked_desc":
+        rows.sort(key=lambda d: d["last_checked_until"] or "", reverse=True)
+    elif sort == "checked_asc":
+        rows.sort(key=lambda d: d["last_checked_until"] or "99999999")
+    elif sort == "open_first":
+        rows.sort(key=lambda d: -d["open_count"])
+    elif sort == "open_last":
+        rows.sort(key=lambda d: d["open_count"])
+    return rows
+
+
+def _migrate_stale_pcodes() -> dict:
+    """一次性搬家用：資料來源從全國法規資料庫換成勞動法令查詢系統之後，原本
+    存在資料庫裡的舊代碼（例如 N0060001）在新資料來源查不到對應資料，直接
+    比對會失敗。這裡逐筆檢查現有的追蹤清單：先直接拿現有代碼去問新資料
+    來源，抓得到法規名稱就代表這筆代碼本來就沒事、不用動；抓不到的話改用
+    法規名稱去新資料來源搜尋一次，如果剛好只找到一筆同名結果就自動把
+    laws、findings 兩張表裡的代碼都換成新的（換代碼不會動到既有的鑑別紀錄、
+    備註、已比對到哪一天，因為這些欄位本來就是用代碼去關聯，代碼換了資料
+    還在）；找不到或找到好幾筆同名結果（沒辦法自動判斷哪一筆才對應）就跳過，
+    回報請使用者自行到「新增要追蹤的法規」用關鍵字搜尋、手動確認後重新
+    整理。"""
+    conn = get_db()
+    laws = conn.execute("SELECT * FROM laws").fetchall()
+    migrated, failed, unchanged = [], [], []
+    for law in laws:
+        pcode, law_name = law["pcode"], law["law_name"]
+        try:
+            info = list_versions(pcode)
+            if info["law_name"]:
+                unchanged.append(law_name)
+                continue
+        except Exception:
+            pass
+        try:
+            candidates, _truncated = search_laws_by_keyword(law_name)
+        except Exception as e:
+            failed.append(f"{law_name}（搜尋失敗：{e}）")
+            continue
+        exact = [r for r in candidates if r["law_name"] == law_name]
+        matches = exact or candidates
+        if len(matches) != 1:
+            failed.append(f"{law_name}（自動搜尋找到 {len(matches)} 筆可能對應的結果，需自行確認）")
+            continue
+        new_pcode = matches[0]["pcode"]
+        if new_pcode == pcode:
+            unchanged.append(law_name)
+            continue
+        try:
+            conn.execute("UPDATE laws SET pcode=? WHERE pcode=?", (new_pcode, pcode))
+            conn.execute("UPDATE OR IGNORE findings SET pcode=? WHERE pcode=?", (new_pcode, pcode))
+        except sqlite3.IntegrityError as e:
+            failed.append(f"{law_name}（新代碼 {new_pcode} 更新失敗：{e}）")
+            continue
+        migrated.append(f"{law_name}（{pcode} → {new_pcode}）")
+    conn.commit()
+    conn.close()
+    return {"migrated": migrated, "failed": failed, "unchanged": unchanged}
+
+
+@app.route("/migrate_pcode", methods=["POST"])
+def migrate_pcode():
+    result = _migrate_stale_pcodes()
+    if result["migrated"]:
+        flash("已自動更新為新資料來源的代碼：" + "、".join(result["migrated"]))
+    if result["failed"]:
+        flash("以下法規需要自行手動處理（建議刪除後用關鍵字搜尋重新新增）：" + "、".join(result["failed"]))
+    if not result["migrated"] and not result["failed"]:
+        flash("檢查完成，所有法規的代碼都已經可以在新資料來源上正常使用，不需要更新。")
+    return redirect(url_for("dashboard"))
+
+
 @app.route("/")
 def dashboard():
+    sort = request.args.get("sort", "")
     conn = get_db()
     laws = conn.execute("SELECT * FROM laws ORDER BY created_at").fetchall()
     rows = []
@@ -633,24 +1035,25 @@ def dashboard():
         d["last_checked_display"] = fmt_date(law["last_checked_until"]) if law["last_checked_until"] else "尚未比對"
         rows.append(d)
     conn.close()
-    return render(DASHBOARD_BODY, laws=rows, today=date.today().isoformat())
+    rows = _sort_dashboard_rows(rows, sort)
+    year_start = date(date.today().year, 1, 1).isoformat()
+    return render(DASHBOARD_BODY, laws=rows, today=date.today().isoformat(), year_start=year_start, sort=sort)
 
 
-@app.route("/laws", methods=["POST"])
-def add_law():
-    pcode = request.form.get("pcode", "").strip()
-    start_date = request.form.get("start_date", "").strip().replace("-", "")
-    if not pcode:
-        flash("請輸入法規代碼。")
-        return redirect(url_for("dashboard"))
-    try:
-        info = list_versions(pcode)
-    except requests.RequestException as e:
-        flash(f"連線失敗：{e}")
-        return redirect(url_for("dashboard"))
+def _add_law_by_pcode(pcode: str, start_date: str, end_date: str = None) -> tuple:
+    """新增一部要追蹤的法規（給單筆新增、批次新增共用）。成功回傳
+    (法規名稱, 比對訊息或 None)；失敗時丟出 requests.RequestException 或
+    RuntimeError，由呼叫端決定怎麼顯示。
+
+    有給 end_date 的話，代表使用者選的不只是「追蹤起始日」，還有明確的
+    「結束日期」——這種情況新增完馬上就跑一次比對（範圍剛好是
+    起始日～結束日），直接把這段期間內的異動存進待鑑別清單，不用再等她
+    自己另外按「立即比對」；沒給 end_date（例如舊的單筆輸入 pcode 表單）
+    就維持原本的行為，只設定追蹤起始日當基準，之後再由使用者自己按
+    「立即比對」。"""
+    info = list_versions(pcode)
     if not info["law_name"]:
-        flash(f"抓不到 pcode={pcode} 的法規名稱，請確認代碼是否正確。")
-        return redirect(url_for("dashboard"))
+        raise RuntimeError(f"抓不到 pcode={pcode} 的法規名稱，請確認代碼是否正確。")
 
     # last_checked_until 的定義統一是「已經確認到這一天為止，之後的檢查只看
     # 更新的部分」；所以「追蹤起始日」要換算成「起始日前一天」存起來，這樣第一次
@@ -667,7 +1070,74 @@ def add_law():
     )
     conn.commit()
     conn.close()
-    flash(f"已新增「{info['law_name']}」，追蹤起始日設為 {fmt_date(start_date)}。")
+
+    check_msg = _run_check(pcode, until=end_date) if end_date else None
+    return info["law_name"], check_msg
+
+
+@app.route("/laws", methods=["POST"])
+def add_law():
+    pcode = request.form.get("pcode", "").strip()
+    start_date = request.form.get("start_date", "").strip().replace("-", "")
+    end_date = request.form.get("end_date", "").strip().replace("-", "")
+    if not pcode:
+        flash("請輸入法規代碼。")
+        return redirect(url_for("dashboard"))
+    try:
+        law_name, check_msg = _add_law_by_pcode(pcode, start_date, end_date or None)
+    except requests.RequestException as e:
+        flash(f"連線失敗：{e}")
+        return redirect(url_for("dashboard"))
+    except RuntimeError as e:
+        flash(str(e))
+        return redirect(url_for("dashboard"))
+    msg = f"已新增「{law_name}」，追蹤起始日設為 {fmt_date(start_date)}。"
+    if check_msg:
+        msg += f" {check_msg}"
+    flash(msg)
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/laws/batch", methods=["POST"])
+def add_laws_batch():
+    pcodes = [p.strip() for p in request.form.getlist("selected_pcodes") if p.strip()]
+    # 這兩個表單欄位是 <input type="date">，瀏覽器送出的格式是「YYYY-MM-DD」；
+    # 網址查詢字串（給 search_laws 重新導向用）要保留這個帶槓的格式，日期
+    # 輸入框才讀得回去，內部比對邏輯用的「YYYYMMDD」緊湊格式則另外去掉槓
+    # 再處理，兩種格式不要弄混。
+    start_date_iso = request.form.get("start_date", "").strip()
+    end_date_iso = request.form.get("end_date", "").strip()
+    start_date = start_date_iso.replace("-", "")
+    end_date = end_date_iso.replace("-", "")
+    keyword = request.form.get("kw", "")
+    sort = request.form.get("sort", "")
+
+    if not pcodes:
+        flash("請至少勾選一部法規再按追蹤。")
+        return redirect(url_for(
+            "search_laws", kw=keyword, sort=sort, start_date=start_date_iso, end_date=end_date_iso
+        ))
+
+    added, failed, check_msgs = [], [], []
+    for pcode in pcodes:
+        try:
+            law_name, check_msg = _add_law_by_pcode(pcode, start_date, end_date or None)
+            added.append(law_name)
+            if check_msg:
+                check_msgs.append(check_msg)
+        except (requests.RequestException, RuntimeError) as e:
+            failed.append(f"{pcode}（{e}）")
+
+    msgs = []
+    if added:
+        range_text = f"{fmt_date(start_date)}"
+        if end_date:
+            range_text += f" ～ {fmt_date(end_date)}"
+        msgs.append(f"已新增追蹤 {len(added)} 部法規，範圍 {range_text}：" + "、".join(added))
+    msgs.extend(check_msgs)
+    if failed:
+        msgs.append(f"{len(failed)} 部新增失敗：" + "、".join(failed))
+    flash(" ／ ".join(msgs))
     return redirect(url_for("dashboard"))
 
 
@@ -681,6 +1151,15 @@ SEARCH_BODY = """
         <label>法規名稱關鍵字（不用打完整全名，例如「教育訓練規則」）</label>
         <input type="text" name="kw" value="{{ keyword }}" placeholder="例如：教育訓練規則" autofocus>
       </div>
+      <div style="flex:0;min-width:150px;">
+        <label>追蹤起始日（套用到下面所有勾選的法規）</label>
+        <input type="date" name="start_date" value="{{ start_date }}">
+      </div>
+      <div style="flex:0;min-width:150px;">
+        <label>追蹤結束日（選填，不填就先只設定起始日）</label>
+        <input type="date" name="end_date" value="{{ end_date }}">
+      </div>
+      <input type="hidden" name="sort" value="{{ sort }}">
       <div style="flex:0;">
         <button class="btn btn-primary" type="submit">搜尋</button>
       </div>
@@ -692,28 +1171,60 @@ SEARCH_BODY = """
 <div class="flash">{{ error }}</div>
 {% elif keyword %}
   {% if results %}
+  <form method="post" action="{{ url_for('add_laws_batch') }}">
+  <input type="hidden" name="kw" value="{{ keyword }}">
+  <input type="hidden" name="start_date" value="{{ start_date }}">
+  <input type="hidden" name="end_date" value="{{ end_date }}">
+  <div class="card" style="padding:14px 16px;margin-bottom:12px;">
+    <div class="row" style="align-items:end;">
+      <div class="muted" style="font-size:12.5px;">
+        追蹤範圍：{{ start_date }}{% if end_date %} ～ {{ end_date }}{% endif %}
+        （要改的話調整上面搜尋列的日期後重新搜尋一次）
+      </div>
+      <div style="flex:0;">
+        <button class="btn btn-primary" type="submit">追蹤已勾選的法規</button>
+      </div>
+      <div class="muted" style="font-size:12.5px;">先勾選左邊要追蹤的法規（可複選），再按這裡一次新增</div>
+    </div>
+  </div>
+  <div class="row" style="align-items:end;margin-bottom:10px;">
+    <div style="flex:0;min-width:200px;">
+      <label>排序方式</label>
+      <select onchange="location.href='{{ url_for('search_laws', kw=keyword, start_date=start_date, end_date=end_date) }}&sort='+this.value">
+        <option value="" {{ "selected" if not sort else "" }}>預設（符合度）</option>
+        <option value="amend_desc" {{ "selected" if sort=="amend_desc" else "" }}>現行修正日期：新→舊</option>
+        <option value="amend_asc" {{ "selected" if sort=="amend_asc" else "" }}>現行修正日期：舊→新</option>
+      </select>
+    </div>
+  </div>
   <div class="table-scroll">
   <table>
-    <thead><tr><th>法規名稱</th><th>pcode</th><th>現行修正日期</th><th style="width:220px;">操作</th></tr></thead>
+    <thead><tr>
+      <th style="width:40px;">
+        <input type="checkbox"
+          onclick="var checked=this.checked;this.closest('table').querySelectorAll('.pick-law').forEach(function(c){c.checked=checked;});"
+          title="全選／全不選">
+      </th>
+      <th>法規名稱</th><th>現行修正日期</th><th>pcode</th><th style="width:140px;">狀態</th>
+    </tr></thead>
     <tbody>
       {% for r in results %}
       <tr>
-        <td>{{ r.law_name }}{% if r.repealed %} <span class="pill pill-open">已廢止</span>{% endif %}</td>
-        <td class="muted">{{ r.pcode }}</td>
-        <td>{{ r.amend_date_display or "-" }}</td>
         <td>
           {% if r.pcode in tracked %}
-          <a class="btn" href="{{ url_for('law_detail', pcode=r.pcode) }}">已在追蹤清單，查看</a>
+          <input type="checkbox" disabled title="已在追蹤清單">
           {% else %}
-          <form method="post" action="{{ url_for('add_law') }}" class="row" style="gap:6px;flex-wrap:nowrap;">
-            <input type="hidden" name="pcode" value="{{ r.pcode }}">
-            <div style="min-width:130px;">
-              <input type="date" name="start_date" value="{{ today }}" required>
-            </div>
-            <div style="flex:0;">
-              <button class="btn btn-primary" type="submit">開始追蹤</button>
-            </div>
-          </form>
+          <input type="checkbox" class="pick-law" name="selected_pcodes" value="{{ r.pcode }}">
+          {% endif %}
+        </td>
+        <td>{{ r.law_name }}{% if r.repealed %} <span class="pill pill-open">已廢止</span>{% endif %}</td>
+        <td>{{ r.amend_date_display or "-" }}</td>
+        <td class="muted">{{ r.pcode }}</td>
+        <td>
+          {% if r.pcode in tracked %}
+          <a class="btn" href="{{ url_for('law_detail', pcode=r.pcode) }}">已在追蹤，查看</a>
+          {% else %}
+          <span class="muted">未追蹤</span>
           {% endif %}
         </td>
       </tr>
@@ -721,6 +1232,7 @@ SEARCH_BODY = """
     </tbody>
   </table>
   </div>
+  </form>
   {% if truncated %}
   <p class="muted" style="margin-top:10px;">符合的結果較多，這裡只列出前面幾筆，如果沒看到你要的法規，
     請輸入更精確的關鍵字（例如加上「辦法」「規則」「標準」等法規名稱裡的字）。</p>
@@ -736,18 +1248,32 @@ SEARCH_BODY = """
 @app.route("/search")
 def search_laws():
     keyword = request.args.get("kw", "").strip()
+    sort = request.args.get("sort", "")
+    today_str = date.today().isoformat()
+    year_start_str = date(date.today().year, 1, 1).isoformat()
+    # 追蹤起始日／結束日跟著查詢字串走：第一次進來（網址上沒帶這兩個參數）
+    # 才套用預設值（起始日＝今年 1/1，結束日＝今天），只要使用者改過、重新
+    # 搜尋過一次，這兩個值就會原封不動地跟著新的搜尋結果一起帶回來，不會
+    # 搜尋完又跳回預設值，方便直接接著勾選、追蹤。
+    start_date = request.args.get("start_date", "").strip() or year_start_str
+    end_date = request.args.get("end_date", "").strip() or today_str
     results, truncated, error = [], False, None
     if keyword:
         try:
             results, truncated = search_laws_by_keyword(keyword)
         except requests.RequestException as e:
             error = f"連線失敗：{e}"
+    if sort == "amend_desc":
+        results.sort(key=lambda r: roc_to_yyyymmdd(r["amend_date_display"]) or "", reverse=True)
+    elif sort == "amend_asc":
+        results.sort(key=lambda r: roc_to_yyyymmdd(r["amend_date_display"]) or "99999999")
     conn = get_db()
     tracked = {r["pcode"] for r in conn.execute("SELECT pcode FROM laws").fetchall()}
     conn.close()
     return render(
         SEARCH_BODY, keyword=keyword, results=results, truncated=truncated,
-        error=error, tracked=tracked, today=date.today().isoformat(),
+        error=error, tracked=tracked, today=today_str, sort=sort,
+        start_date=start_date, end_date=end_date,
     )
 
 
@@ -762,7 +1288,10 @@ def delete_law(pcode):
     return redirect(url_for("dashboard"))
 
 
-def _run_check(pcode: str):
+def _run_check(pcode: str, until: str = None):
+    """跑一次比對；until 預設 None 表示比對到今天（平常「立即比對」用的行為），
+    新增法規時如果有給明確的「結束日期」，會帶著 until 呼叫這裡，把第一次
+    比對限定在使用者選的「起始日～結束日」這段範圍內，而不是自動比到今天。"""
     conn = get_db()
     law = conn.execute("SELECT * FROM laws WHERE pcode=?", (pcode,)).fetchone()
     conn.close()
@@ -772,17 +1301,21 @@ def _run_check(pcode: str):
     # 它的隔天開始算，才不會把已經看過、已經填好評估的那次異動又抓回來一次。
     since = next_day(law["last_checked_until"]) if law["last_checked_until"] else None
     try:
-        report = build_report(pcode, since=since)
+        report = build_report(pcode, since=since, until=until)
     except (requests.RequestException, RuntimeError) as e:
         return f"[{report_name(law)}] 比對失敗：{e}"
 
     upsert_findings(pcode, report["changed_rows"])
 
     new_baseline = report["new_version_date"] or law["last_checked_until"] or date.today().strftime("%Y%m%d")
+    # 把 build_report 算出來的 note（例如「資料庫最早只能追溯到 XXXX」這種
+    # 追溯範圍受限的提醒）存回法規清單，讓首頁那一列也看得到，不會像以前
+    # 一樣算出來卻沒地方顯示、直接被吞掉。之後追蹤基準往前推進、不再有這個
+    # 限制時，note 就會是空字串，畫面上自然不會再顯示。
     conn = get_db()
     conn.execute(
-        "UPDATE laws SET last_checked_until=?, law_name=?, amend_date_display=? WHERE pcode=?",
-        (new_baseline, report["law_name"], report["amend_date"], pcode),
+        "UPDATE laws SET last_checked_until=?, law_name=?, amend_date_display=?, note=? WHERE pcode=?",
+        (new_baseline, report["law_name"], report["amend_date"], report.get("note") or "", pcode),
     )
     conn.commit()
     conn.close()
@@ -790,6 +1323,14 @@ def _run_check(pcode: str):
     n = len(report["changed_rows"])
     if n == 0:
         return f"「{report['law_name']}」：這段期間沒有新的修正。"
+    if report.get("baseline_missing"):
+        # baseline_missing 代表這幾筆是靠沿革公告文字解析出來、不是逐字比對舊
+        # 條文得到的結果，訊息要講清楚、跟真的比對到差異的情況分開，提醒她
+        # 「修正」「刪除」的條文還是要自己核對過才能結案。
+        return (
+            f"「{report['law_name']}」：⚠ 追蹤期間內有修正，但資料庫沒有保留舊條文可自動比對，"
+            f"已根據沿革公告解析出 {n} 條可能異動的條文存入待鑑別清單，請自行核對後手動鑑別、結案。"
+        )
     return f"「{report['law_name']}」：新增／更新了 {n} 條異動，已存入待鑑別清單。"
 
 
